@@ -4,10 +4,19 @@
  * out of date.
  *
  * On install it fetches index.html and reads the hashed asset URLs straight
- * out of it, so the exact files this build needs are cached without anything
- * having to be generated. (Runtime caching alone is not enough: the very
- * first page load happens before this worker is controlling the page, so
- * those requests would never pass through it.)
+ * out of it, then reads *those* for the names they mention in turn — which
+ * is how the metadata parser worker gets cached, since the bundler names it
+ * inside the main script rather than in the HTML. So the exact files this
+ * build needs are cached without anything having to be generated. (Runtime
+ * caching alone is not enough: the very first page load happens before this
+ * worker is controlling the page, so those requests would never pass
+ * through it.)
+ *
+ * Why it matters past the offline promise: importing forty files must not
+ * touch the network at all. The parser worker, the stylesheet, the fonts
+ * (system, so there are none to fetch) and the default music track are all
+ * on disk after the first load, so a hotel Wi-Fi dropping out mid-import
+ * cannot be the reason an import fails.
  *
  * Video blobs never touch this cache — they live in IndexedDB.
  *
@@ -22,13 +31,23 @@
  * worker takes over (see `main.ts`).
  */
 
-const CACHE = 'moment-vlog-v5';
+const CACHE = 'moment-vlog-v6';
 const EXTRA = [
   './',
   './manifest.webmanifest',
   './icons/icon-192.png',
   './icons/icon-512.png',
   './icons/apple-touch-icon.png',
+  /**
+   * The track the app suggests when it has nothing to go on.
+   *
+   * Music is not needed to import — it is chosen at the end and only
+   * actually played when something plays — but a flaky connection should
+   * not be able to make the one default track unavailable either, and one
+   * and a half megabytes buys that outright. The other seventeen are
+   * cached by the fetch handler the first time each is heard.
+   */
+  './music/carefree.m4a',
 ];
 
 /**
@@ -50,6 +69,35 @@ function assetUrlsFrom(html) {
   return [...urls];
 }
 
+/**
+ * Pulls hashed asset names out of a bundle, resolved against the bundle.
+ *
+ * The shell HTML names the main script and the stylesheet, and that was all
+ * this worker ever cached. It missed the one asset the import cannot do
+ * without: the metadata parser worker, which the bundler emits as a separate
+ * file and names *inside* the main script —
+ *
+ *   new Worker(new URL("worker-D5R07p5H.js", import.meta.url))
+ *
+ * On a first load over a bad connection that file would simply fail to
+ * fetch, and the parser pool would fall back to reading sixty files on the
+ * main thread. It worked, slowly, and it had no business depending on the
+ * network at all. So the bundle is read as text and the hashed names in it
+ * are cached too, which keeps this worker free of a generated manifest: it
+ * reads the build rather than being told about it.
+ */
+function nestedUrlsFrom(source, baseUrl) {
+  const urls = new Set();
+  for (const match of source.matchAll(/["'`]([\w.-]+-[A-Za-z0-9_-]{6,12}\.(?:js|css|wasm))["'`]/g)) {
+    try {
+      urls.add(new URL(match[1], baseUrl).href);
+    } catch {
+      // Not a resolvable name; nothing to cache.
+    }
+  }
+  return [...urls];
+}
+
 async function precache() {
   const cache = await caches.open(CACHE);
   let assets = [];
@@ -65,17 +113,30 @@ async function precache() {
     // Offline during install: whatever is already cached still serves.
   }
 
+  /** Caches one URL, and hands back its text when it is a script. */
+  const take = async (url) => {
+    try {
+      const response = await fetch(url, { cache: 'reload' });
+      if (!response.ok) return null;
+      const isScript = new URL(response.url ?? url, self.location.href).pathname.endsWith('.js');
+      const text = isScript ? await response.clone().text() : null;
+      await cache.put(url, response);
+      return text ? { url, text } : null;
+    } catch {
+      return null;
+    }
+  };
+
   // One at a time, so a single missing file cannot fail the whole install.
-  await Promise.all(
-    [...EXTRA, ...assets].map(async (url) => {
-      try {
-        const response = await fetch(url, { cache: 'reload' });
-        if (response.ok) await cache.put(url, response);
-      } catch {
-        // Skip this one.
-      }
-    }),
-  );
+  const scripts = (await Promise.all([...EXTRA, ...assets].map(take))).filter(Boolean);
+
+  // Then whatever those scripts name — the parser worker, above all.
+  const nested = new Set();
+  for (const script of scripts) {
+    const base = new URL(script.url, self.location.href).href;
+    for (const url of nestedUrlsFrom(script.text, base)) nested.add(url);
+  }
+  await Promise.all([...nested].map(take));
 }
 
 self.addEventListener('install', (event) => {
